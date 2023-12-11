@@ -23,6 +23,7 @@ import kubric as kb
 from kubric.simulator import PyBullet
 from kubric.renderer import Blender
 import numpy as np
+from experiment import *
 
 
 # --- Some configuration values
@@ -161,6 +162,46 @@ def get_linear_lookat_motion_start_end(
     return camera_start, camera_end
 
 
+# Camera
+logging.info("Setting up the Camera...")
+scene.camera = kb.PerspectiveCamera(focal_length=35., sensor_width=32)
+if FLAGS.camera == "fixed_random":
+  scene.camera.position = kb.sample_point_in_half_sphere_shell(
+      inner_radius=7., outer_radius=9., offset=0.1)
+  scene.camera.look_at((0, 0, 0))
+elif (
+    config.camera == "linear_movement"
+    or config.camera == "linear_movement_linear_lookat"
+):
+
+  is_panning = config.camera == "linear_movement_linear_lookat"
+  camera_inner_radius = 6.0 if is_panning else 8.0
+  camera_start, camera_end = get_linear_camera_motion_start_end(
+      movement_speed=rng.uniform(low=0., high=FLAGS.max_camera_movement)
+  )
+  if is_panning:
+    lookat_start, lookat_end = get_linear_lookat_motion_start_end()
+
+  # linearly interpolate the camera position between these two points
+  # while keeping it focused on the center of the scene
+  # we start one frame early and end one frame late to ensure that
+  # forward and backward flow are still consistent for the last and first frames
+  for frame in range(FLAGS.frame_start - 1, FLAGS.frame_end + 2):
+    interp = ((frame - FLAGS.frame_start + 1) /
+              (FLAGS.frame_end - FLAGS.frame_start + 3))
+    scene.camera.position = (interp * np.array(camera_start) +
+                             (1 - interp) * np.array(camera_end))
+    if is_panning:
+      scene.camera.look_at(
+          interp * np.array(lookat_start)
+          + (1 - interp) * np.array(lookat_end)
+      )
+    else:
+      scene.camera.look_at((0, 0, 0))
+    scene.camera.keyframe_insert("position", frame)
+    scene.camera.keyframe_insert("quaternion", frame)
+
+
 # ---- Object placement ----
 train_split, test_split = gso.get_test_split(fraction=0.1)
 if FLAGS.objects_split == "train":
@@ -238,86 +279,57 @@ logging.info("Running the simulation ...")
 animation, collisions = simulator.run(frame_start=0,
                                       frame_end=scene.frame_end+1)
 
-# Camera
-logging.info("Setting up the Camera...")
-scene.camera = kb.PerspectiveCamera(focal_length=35., sensor_width=32)
-if FLAGS.camera == "fixed_random":
-  scene.camera.position = kb.sample_point_in_half_sphere_shell(
-      inner_radius=7., outer_radius=9., offset=0.1)
-  scene.camera.look_at((0, 0, 0))
-elif (
-    config.camera == "linear_movement"
-    or config.camera == "linear_movement_linear_lookat"
-):
-
-  is_panning = config.camera == "linear_movement_linear_lookat"
-  camera_inner_radius = 6.0 if is_panning else 8.0
-  camera_start, camera_end = get_linear_camera_motion_start_end(
-      movement_speed=rng.uniform(low=0., high=FLAGS.max_camera_movement)
-  )
-  if is_panning:
-    lookat_start, lookat_end = get_linear_lookat_motion_start_end()
-
-  # linearly interpolate the camera position between these two points
-  # while keeping it focused on the center of the scene
-  # we start one frame early and end one frame late to ensure that
-  # forward and backward flow are still consistent for the last and first frames
-  for frame in range(FLAGS.frame_start - 1, FLAGS.frame_end + 2):
-    interp = ((frame - FLAGS.frame_start + 1) /
-              (FLAGS.frame_end - FLAGS.frame_start + 3))
-    scene.camera.position = (interp * np.array(camera_start) +
-                             (1 - interp) * np.array(camera_end))
-    if is_panning:
-      scene.camera.look_at(
-          interp * np.array(lookat_start)
-          + (1 - interp) * np.array(lookat_end)
-      )
-    else:
-      scene.camera.look_at((0, 0, 0))
-    scene.camera.keyframe_insert("position", frame)
-    scene.camera.keyframe_insert("quaternion", frame)
-
 # --- Rendering
 if FLAGS.save_state:
   logging.info("Saving the renderer state to '%s' ",
                output_dir / "scene.blend")
   renderer.save_state(output_dir / "scene.blend")
 
+# --- Multi-camera rendering
+num_cameras = 50 # Change however many cameras you want
+radius = 10
+positions = fibonacci_hemisphere(num_cameras, radius)
 
-logging.info("Rendering the scene ...")
-data_stack = renderer.render()
+for i in range(num_cameras):
+  current_output_dir = output_dir / f"camera_{i+1}"
+  current_output_dir.mkdir(parents=True, exist_ok=True)
+  scene.camera.position = positions[i]
+  scene.camera.look_at((0, 0, 0))
 
-# --- Postprocessing
-kb.compute_visibility(data_stack["segmentation"], scene.assets)
-visible_foreground_assets = [asset for asset in scene.foreground_assets
-                             if np.max(asset.metadata["visibility"]) > 0]
-visible_foreground_assets = sorted(  # sort assets by their visibility
-    visible_foreground_assets,
-    key=lambda asset: np.sum(asset.metadata["visibility"]),
-    reverse=True)
+  logging.info("Rendering scene %d ...", i)
+  data_stack = renderer.render()
 
-data_stack["segmentation"] = kb.adjust_segmentation_idxs(
-    data_stack["segmentation"],
-    scene.assets,
-    visible_foreground_assets)
-scene.metadata["num_instances"] = len(visible_foreground_assets)
+  # --- Postprocessing
+  kb.compute_visibility(data_stack["segmentation"], scene.assets)
+  visible_foreground_assets = [asset for asset in scene.foreground_assets
+                              if np.max(asset.metadata["visibility"]) > 0]
+  visible_foreground_assets = sorted(  # sort assets by their visibility
+      visible_foreground_assets,
+      key=lambda asset: np.sum(asset.metadata["visibility"]),
+      reverse=True)
 
-# Save to image files
-kb.write_image_dict(data_stack, output_dir)
-kb.post_processing.compute_bboxes(data_stack["segmentation"],
-                                  visible_foreground_assets)
+  data_stack["segmentation"] = kb.adjust_segmentation_idxs(
+      data_stack["segmentation"],
+      scene.assets,
+      visible_foreground_assets)
+  scene.metadata["num_instances"] = len(visible_foreground_assets)
 
-# --- Metadata
-logging.info("Collecting and storing metadata for each object.")
-kb.write_json(filename=output_dir / "metadata.json", data={
-    "flags": vars(FLAGS),
-    "metadata": kb.get_scene_metadata(scene),
-    "camera": kb.get_camera_info(scene.camera),
-    "instances": kb.get_instance_info(scene, visible_foreground_assets),
-})
-kb.write_json(filename=output_dir / "events.json", data={
-    "collisions":  kb.process_collisions(
-        collisions, scene, assets_subset=visible_foreground_assets),
-})
+  # Save to image files
+  kb.write_image_dict(data_stack, current_output_dir)
+  kb.post_processing.compute_bboxes(data_stack["segmentation"],
+                                    visible_foreground_assets)
+
+  # --- Metadata
+  logging.info("Collecting and storing metadata for each object.")
+  kb.write_json(filename=current_output_dir / "metadata.json", data={
+      "flags": vars(FLAGS),
+      "metadata": kb.get_scene_metadata(scene),
+      "camera": kb.get_camera_info(scene.camera),
+      "instances": kb.get_instance_info(scene, visible_foreground_assets),
+  })
+  kb.write_json(filename=current_output_dir / "events.json", data={
+      "collisions":  kb.process_collisions(
+          collisions, scene, assets_subset=visible_foreground_assets),
+  })
 
 kb.done()
